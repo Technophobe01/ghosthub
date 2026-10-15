@@ -209,6 +209,10 @@ before creation. A failure still writes
 `images/sandbox/reports/sha256-<digest>.json` for diagnosis and returns
 nonzero.
 
+Host-side fixture commands ignore inherited Git variables and global or system
+Git configuration. Repository discovery stops at the fixture directory, so a
+missing fixture cannot make a command use the enclosing Ghosthub checkout.
+
 Vetting repeats the Git metadata write and move probes after Stop/Start. A
 provider version whose read-only overlays do not survive restart therefore
 cannot produce a passing report.
@@ -226,6 +230,14 @@ manifest path. Findings from OS packages and language
 runtimes embedded in binaries follow the same policy, but a disposition for one
 binary or ecosystem cannot authorize another. A fixable Critical or High
 finding always blocks; an unfixed one needs a current exact disposition.
+
+If the vendor confirms that the installed package fixes a finding but Trivy
+still has no fixed-version entry, a short-lived disposition may record that
+scanner delay. Cite the vendor advisory and make the image contract reject
+package versions older than the fix. Remove the disposition and temporary
+version check as soon as Trivy recognizes the fix: an unmatched disposition
+also blocks validation. Do not extend its expiry instead of checking the
+current vendor and scanner evidence.
 
 The developer who runs `sandbox-image-vet` and the protected-environment
 reviewer are trusted operators. GitHub-hosted promotion cannot authenticate
