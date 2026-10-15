@@ -5,6 +5,14 @@ test, and documentation-only changes are omitted.
 
 ## [Unreleased]
 
+## [0.11.2] - 2026-10-15
+
+### Fixed
+
+- Reconnect to an existing worktree session after changing its branch.
+- Stray or incomplete Git worktree records no longer block workspace
+  operations for the whole repository.
+
 ## [0.11.1] - 2026-10-07
 
 ### Fixed
@@ -477,7 +485,8 @@ local or remote hosts.
   automatically after lost connections, and navigate projects and worktrees
   managed by kwt.
 
-[Unreleased]: https://github.com/kenn-io/ghosthub/compare/v0.11.1...HEAD
+[Unreleased]: https://github.com/kenn-io/ghosthub/compare/v0.11.2...HEAD
+[0.11.2]: https://github.com/kenn-io/ghosthub/compare/v0.11.1...v0.11.2
 [0.11.1]: https://github.com/kenn-io/ghosthub/compare/v0.11.0...v0.11.1
 [0.11.0]: https://github.com/kenn-io/ghosthub/compare/v0.10.2...v0.11.0
 [0.10.2]: https://github.com/kenn-io/ghosthub/compare/v0.10.1...v0.10.2
