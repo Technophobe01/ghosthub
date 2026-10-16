@@ -164,6 +164,8 @@ layer, as subject to direct iteration.
   context.
 - Prefix every Rust-port pull request title with `Rust Port:` so changelog and
   release-note entries clearly identify Rust-port work.
+- Always attach current application screenshots to Rust-port pull requests.
+  Inspect the captures before uploading and use only synthetic session data.
 - The canonical repository is `https://github.com/kenn-io/ghosthub`. Only push
   or open pull requests when the user explicitly asks.
 - Pull requests must have a user-facing benefit or improve the developer
@@ -230,6 +232,9 @@ parent's checklist.
 
 - Run `make format` before committing Swift changes. CI runs
   `make format-check` and fails on drift.
+- Linux commits run Swift formatting and basic file checks. The Prek Swift
+  compiler hook runs only on macOS; macOS CI runs `make swift-warning-check`.
+  Use the formatter pinned in `mise.toml`; do not bypass hooks for Linux work.
 - Run Swift tests with `make swift-test` or targeted `xcodebuild test`.
 - Tests that start a real tmux server must use `TestTmuxServer` and run under
   `tools/run_swift_tests.sh`; command-construction-only and Zellij tests do not

@@ -2,19 +2,23 @@ name: Rust Port CI
 
 on:
   push:
-    branches: [rust-port]
+    branches: [main]
     paths:
       - rust/**
       - contracts/**
       - docs/rust-port.md
       - .github/workflows/rust-port.yml
+      - Makefile
+      - KWT_REVISION
   pull_request:
-    branches: [rust-port]
+    branches: [main]
     paths:
       - rust/**
       - contracts/**
       - docs/rust-port.md
       - .github/workflows/rust-port.yml
+      - Makefile
+      - KWT_REVISION
   workflow_dispatch:
 
 permissions:
@@ -71,7 +75,8 @@ jobs:
             libxkbcommon-x11-dev \
             lld \
             llvm \
-            pkg-config
+            pkg-config \
+            tmux
 
       - name: Test and lint on Linux
         if: runner.os == 'Linux'

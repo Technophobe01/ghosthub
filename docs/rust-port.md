@@ -1,9 +1,11 @@
 # Windows and Linux Rust Port
 
 This document is the maintained design for native Ghosthub applications on
-Windows and Linux. The first product slice is Windows-only, uses tmux in WSL2,
-and discovers optional Herdr and Zellij sessions there; Linux remains a
-compile-and-contract target until a native Linux product slice is authorized.
+Windows and Linux. The existing local-session product slice uses tmux in WSL2
+on Windows and discovers optional Herdr and Zellij sessions there. Native
+Linux discovers, attaches to, creates, and confirms kills of local tmux
+sessions through the same workflow layer. Local Linux worktrees, optional
+backends, and helper packaging remain separate parity work.
 The shipped macOS application remains SwiftUI/AppKit with libghostty. The
 shared product and terminal invariants remain authoritative in
 [architecture.md](architecture.md) and
@@ -21,8 +23,10 @@ away from SwiftUI.
 - macOS remains SwiftUI/AppKit and libghostty.
 - Windows uses Rust and GPUI. Its first product slice attaches to real tmux in
   a WSL2 distro through `wsl.exe` and ConPTY.
-- Linux remains in Rust CI for compilation, contracts, architecture, lint, and
-  dependency policy. A native Linux application is deferred.
+- Linux enables X11 and Wayland in the native Rust/GPUI shell and uses a
+  native PTY for local tmux clients. X11 development acceptance does not
+  establish Wayland or hardware-GPU acceptance. Native helper packaging
+  remains planned work.
 - All platforms preserve the Host, Project, Worktree, and ordinary
   multiplexer-session mental model.
 - Kwt remains authoritative for project/worktree identity and exact session
@@ -97,10 +101,79 @@ The first checked-in workspace pins Rust 1.96.1 and GPUI 0.2.2. It contains
 Windows ARM64 process. Linux enables both Wayland and X11 backends and is
 compiled and tested independently rather than inferred from the Windows build.
 
-Rust CI exists only in `.github/workflows/rust-port.yml`. It runs Windows and
-Linux jobs for pushes and pull requests targeting the `rust-port` integration
-branch. It is neither present on nor triggered for `main`; the shipped Swift
-application's CI remains unchanged.
+Rust CI is defined in `.github/workflows/rust-port.yml`. It runs Windows and
+Linux jobs for relevant pushes and pull requests targeting `main`, including
+changes to the shared Makefile and pinned KWT revision. The shipped Swift
+application's CI remains separate.
+
+### Build and inspect the Linux application
+
+Use the toolchain pinned in `rust/rust-toolchain.toml`. On Debian or Ubuntu,
+install the GPUI build dependencies listed in the Rust CI workflow. Running
+the app also needs a Vulkan driver and a font GPUI can resolve. For a headless
+development host, Mesa's software Vulkan driver and DejaVu fonts suffice:
+
+```sh
+sudo apt-get install --no-install-recommends \
+  build-essential clang cmake libfontconfig-dev libvulkan1 \
+  libwayland-dev libx11-xcb-dev libxkbcommon-x11-dev lld llvm pkg-config \
+  mesa-vulkan-drivers fonts-dejavu-core xvfb xauth xdotool ffmpeg tmux
+make rust-build
+make rust-check
+```
+
+The executable is `rust/target/debug/ghosthub`. Use disposable application
+roots when inspecting a development build. This keeps configured hosts,
+helpers, and saved preferences separate from installed application state:
+
+```sh
+capture_root=$(mktemp -d)
+export GHOSTHUB_HOME="$capture_root/home"
+export GHOSTHUB_CONFIG_HOME="$capture_root/config"
+export GHOSTHUB_STATE_HOME="$capture_root/state"
+./rust/target/debug/ghosthub
+```
+
+For native screenshots without a desktop, run the executable under
+`xvfb-run -a -s '-screen 0 1280x800x24'`. Use `xdotool` to wait for the
+Ghosthub window, move it, and give it focus before capturing the X11 display
+with FFmpeg. Inspect the image: finding a window alone does not prove that
+GPUI has painted it. Stop the app and virtual display after capture. Keep
+these development captures local; accepted website screenshots follow the
+separate [publishing workflow](https://github.com/kenn-io/ghosthub/blob/main/website/README.md).
+
+With empty configuration, Linux publishes a **Local** host and discovers
+the default tmux server after the first frame. A missing tmux executable
+leaves the application shell available with a host diagnostic. Local Linux
+settings are separate from Windows `[wsl]` settings:
+
+```toml
+[local]
+tmux-binary = "/usr/bin/tmux"
+# Optional absolute directory passed as TMUX_TMPDIR:
+# socket-directory = "/tmp/ghosthub-demo-tmux"
+```
+
+For development captures, configure `local.socket-directory` to a private
+temporary directory containing only synthetic sessions. Redirecting the app's
+state roots alone does not isolate tmux. Existing-server attachments preserve
+the server's configuration. Test fixtures start their private server with
+`-f /dev/null` and a controlled shell before connecting the app.
+
+The native Linux lifecycle tests run in `make rust-check` and require
+`/usr/bin/tmux`. They exercise real discovery, terminal output, input, resize,
+creation, detach/close survival, and confirmed kills that reject a same-named
+replacement. Software-rendered X11 captures do not establish Wayland,
+hardware GPU, Windows WSL, or ConPTY acceptance.
+
+Track implementation and baseline failures in the existing Kata project.
+Check `kata federation status --agent` before resuming across machines; retain
+the local spoke binding when federation is healthy. Work in this order:
+establish build and rendering evidence, resolve reproduced baseline failures,
+then deliver the native Linux local-session slice. Continue remote/worktree,
+Settings, persistence, and platform delivery work through their existing
+issues and focused children. Do not infer completion from an old issue
+comment or a passing compile check.
 
 ## 2. Terminal Presentation and Session Execution
 
@@ -134,6 +207,26 @@ does not reconnect a local `wsl.exe` relay after client exit. Remote OpenSSH
 exit status 255 alone invokes bounded exponential reconnect; a connection
 healthy for 30 seconds resets backoff. Every other status passes through
 unchanged.
+
+### Shared local host boundary
+
+`LocalHost` owns the Linux session machinery used by native Linux and WSL2.
+Its endpoint distinguishes the native machine from a named WSL distribution;
+admission caches cannot cross those endpoints even when runtime evidence
+matches. `LinuxRuntimeIdentity` records the kernel boot ID and PID 1 start
+time. Windows additionally requires a WSL2 kernel before admission.
+
+The native route launches exact POSIX argv through `/usr/bin/env`; the WSL
+route prepends the pinned distribution and `--exec` to the system-owned
+Windows launcher. Both share tmux capability admission, exact session
+identity checks, one-shot creation receipts, and confirmed destruction.
+Workspace and scene state use the local host identity rather than assuming
+every local endpoint is WSL. Neither route reconstructs server panes or kills
+the server when a presentation closes.
+
+Native Linux currently exposes tmux only. It does not probe local Herdr or
+Zellij, activate a local KWT bundle, or start the worktree inventory cadence.
+Those capabilities need their own native acceptance and packaging work.
 
 ### Windows WSL command boundary
 
@@ -372,6 +465,13 @@ answers it, so a relay viewer must run a real VT frontend (xterm.js answers
 DSR natively). A relay viewer that fails to drain the bounded output queue is
 disconnected with a distinct backpressure outcome and its client and PTY are
 torn down; reconnection is a fresh attachment.
+
+On Unix, the shared process layer uses nonblocking PTY descriptors with
+interruptible readiness waits. Teardown cancels those waits before reaping
+the client. A saturated Linux PTY write can remain blocked even after the
+last slave process exits, so killing the client alone cannot bound teardown.
+Reads and writes retain their partial-I/O semantics while the client is live;
+shutdown can abandon undelivered input. Windows retains the ConPTY pipe path.
 
 The invariant is bounded non-lossy delivery with no UI blocking, not the
 absence of a byte channel. PTY bytes are never dropped or placed in an
@@ -1262,8 +1362,8 @@ screenshots.
 If the WSL ConPTY/lifetime or tmux capability gate fails, Windows returns to
 substrate selection; there is no app-lifetime or psmux fallback. If every VT
 candidate fails the terminal-state gate, product integration stops for
-architecture reconsideration. Linux CI remains a compile-and-contract signal,
-not an alternate product delivery branch.
+architecture reconsideration. Linux CI remains a compile-and-contract signal;
+native Linux delivery also requires live session and desktop acceptance.
 
 ### Test categories
 
@@ -1312,6 +1412,13 @@ used as evidence for the Windows ConPTY-to-WSL relay path.
 ### Follow-on order
 
 After Slice 1:
+
+The renewed native Linux work first adds a real local host, ordinary tmux
+discovery and attachment, constructive creation, and confirmed destruction.
+It must prove input, resize, and detach-only lifetime against an isolated
+server through the native application. Local kwt/worktrees and optional
+Herdr/Zellij follow through the same ownership boundaries. The Windows WSL
+slice remains independently tested throughout this work.
 
 1. Local Ghosthub inventory and ordinary worktree RepairOrOpen now ship with
    pinned bundled kwt, project/worktree inventory, branch-backed creation,
