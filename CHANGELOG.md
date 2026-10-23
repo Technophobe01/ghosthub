@@ -5,6 +5,20 @@ test, and documentation-only changes are omitted.
 
 ## [Unreleased]
 
+## [0.11.3] - 2026-10-23
+
+### Fixed
+
+- The bundled kwt helper now rejects certificates from the compromised
+  eMudhra intermediate CAs when it connects to GitHub, for example while
+  importing a pull request. This applies to the local helper and to the
+  copies Ghosthub installs on remote hosts after you update.
+- With Git 2.56 or later, Ghosthub can again show and remove a worktree
+  whose Git link is broken. Before, it stopped with a Git error.
+- After you cancel creating a worktree on a new branch, trying again now
+  works. Before, the retry could reuse the half-made checkout the canceled
+  attempt left behind.
+
 ## [0.11.2] - 2026-10-15
 
 ### Fixed
@@ -485,7 +499,8 @@ local or remote hosts.
   automatically after lost connections, and navigate projects and worktrees
   managed by kwt.
 
-[Unreleased]: https://github.com/kenn-io/ghosthub/compare/v0.11.2...HEAD
+[Unreleased]: https://github.com/kenn-io/ghosthub/compare/v0.11.3...HEAD
+[0.11.3]: https://github.com/kenn-io/ghosthub/compare/v0.11.2...v0.11.3
 [0.11.2]: https://github.com/kenn-io/ghosthub/compare/v0.11.1...v0.11.2
 [0.11.1]: https://github.com/kenn-io/ghosthub/compare/v0.11.0...v0.11.1
 [0.11.0]: https://github.com/kenn-io/ghosthub/compare/v0.10.2...v0.11.0
