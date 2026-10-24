@@ -10133,6 +10133,81 @@ fn counted_remote_host(
 }
 
 #[test]
+fn queued_remote_tmux_creation_stops_when_scene_closes() {
+    let config = RemoteTmuxConfig::new(
+        "ssh:studio",
+        "Studio",
+        SshTarget::new("studio.example", None, None).unwrap(),
+        "/usr/bin/tmux",
+        None,
+    )
+    .unwrap();
+    let host = remote_host_fixture(&config);
+    let snapshot = RemoteTmuxSnapshot::test_fixture(
+        "studio.example",
+        TEST_REMOTE_ROUTE,
+        7,
+        Vec::new(),
+        HerdrInventory::Unavailable,
+        ZellijInventory::Unavailable,
+    );
+    let workspace = Workspace::preview(WorkspaceSnapshot::shell(
+        Appearance::default(),
+        vec![HostItem::ssh(
+            "ssh:studio",
+            "Studio",
+            "studio.example",
+            HostConnectionState::Ready,
+            Vec::new(),
+            None,
+        )],
+    ));
+    workspace.scene.runtime.remote_hosts.lock().unwrap().insert(
+        config.id().to_owned(),
+        RemoteEntry {
+            config,
+            native_host: Some(host.clone()),
+            context: Some(RemoteHostContext {
+                generation: 7,
+                host,
+                snapshot,
+            }),
+            cancellation: None,
+            constructive_cancellation: None,
+            attachment_attempts: Vec::new(),
+            generation: 7,
+        },
+    );
+    let lane = workspace.scene.runtime.session_operations.lock().unwrap();
+    workspace
+        .create_session("ssh:studio", "studio.example", "build")
+        .unwrap();
+    let cancellation = {
+        let hosts = workspace.scene.runtime.remote_hosts.lock().unwrap();
+        let Some(RemoteConstructiveState::Active { cancellation, .. }) =
+            hosts["ssh:studio"].constructive_cancellation.as_ref()
+        else {
+            panic!("creation must register an active cancellation token");
+        };
+        cancellation.clone()
+    };
+    assert!(!cancellation.is_cancelled());
+    workspace.close();
+    assert!(
+        cancellation.is_cancelled(),
+        "closing must cancel creation before the operation lane is released"
+    );
+    drop(lane);
+    settle("cancelled tmux creation", || {
+        !workspace
+            .scene
+            .runtime
+            .remote_constructive_in_flight
+            .load(Ordering::Acquire)
+    });
+}
+
+#[test]
 #[allow(
     clippy::too_many_lines,
     reason = "one linear proof from queued registration through the production runner"

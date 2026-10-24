@@ -258,6 +258,11 @@ on that host. Reconnecting after the key is authorized must clear the error
 and allow normal session attachment. KWT's optional failure `details` object
 is accepted without relaxing stream ordering or route and prompt validation.
 CI runs these tests on Linux.
+Remote tmux creation is also exercised through the application entry point:
+quoted names remain exact, duplicate names are rejected, the terminal accepts
+shell input, and detach or application close preserves the created session.
+First-session creation also checks the shell's UTF-8 locale and non-ASCII input
+with no server running before the connection.
 Windows/WSL controllers and remote macOS servers need separate acceptance.
 
 Track implementation and baseline failures in the existing Kata project.
@@ -365,17 +370,22 @@ Select **Connect** beside that host in the sidebar. Review any host-key or
 authentication prompt before continuing. Select a discovered session to open
 its terminal; switching tmux rows retains the previous presentation.
 
+To create a tmux session, select **+** beside **Tmux Sessions** on the connected
+host, enter a name, and select **Create**. The new session opens immediately.
+Names already listed on that host are rejected. If tmux discovery fails, fix
+the host's tmux path or connection before creating a session.
+
 **Detach** closes the selected client. Closing Ghosthub closes its clients
 and preserves the remote sessions. Reopening the app leaves configured hosts
-disconnected until you select **Connect** again. Remote tmux creation, confirmed
+disconnected until you select **Connect** again. Confirmed remote
 destruction, worktree workflows, and automatic transport recovery remain
 separate work.
 
-![Configure an SSH host in native Linux Ghosthub](https://github.com/user-attachments/assets/1a674ae3-5729-4a66-bb1d-2d2334af6fb5)
+![Review the isolated SSH host key before connecting](https://github.com/user-attachments/assets/cf1646f1-ca95-4960-ad90-de500f053482)
 
-![Review the isolated SSH host key before connecting](https://github.com/user-attachments/assets/02a1114f-591a-43c7-a8c4-9490d49bc4ae)
+![Create the first remote tmux session from native Linux Ghosthub](https://github.com/user-attachments/assets/c786a62b-d672-419d-893b-80ac6b03aebf)
 
-![Native Linux Ghosthub attached to the selected remote tmux session](https://github.com/user-attachments/assets/eb289f35-5076-425b-b176-90628396c0e5)
+![The first remote tmux shell preserves UTF-8 and renders non-ASCII output](https://github.com/user-attachments/assets/0fa7b084-4567-480e-9ce5-f398a7fb20ec)
 
 ### Windows WSL command boundary
 
@@ -1178,11 +1188,18 @@ Each host's tmux, Herdr, and Zellij groups have independent disclosure controls;
 collapsing navigation never detaches a client or changes session lifetime.
 
 The current remote UI supports discovery, attach-only presentation, retained
-switching, detach, one-shot Herdr creation/restart, and one-shot Zellij
+switching, detach, one-shot tmux creation, Herdr creation/restart, and Zellij
 creation. Constructive operations re-probe the backend through the existing
 reviewed lease before launch, publish only an exact post-launch inventory
-match, and run entirely off the UI thread. It deliberately withholds remote
-tmux creation, tmux/Zellij kill, Herdr stop/delete, worktrees,
+match, and run entirely off the UI thread. Tmux creation launches one atomic
+`new-session -A -E` client through the reviewed lease. A nonce-scoped receipt
+reports the server PID, session ID, and creation time from that client's own
+command queue; only inventory matching that identity may become its
+presentation. Reading the receipt has a bounded deadline and best-effort
+cleanup. Later opens use attach-only authority and never replay creation.
+Interactive tmux clients inherit the remote login locale; only inventory
+commands force the C locale for parsing.
+The UI withholds remote tmux/Zellij kill, Herdr stop/delete, worktrees,
 reconnect/backoff, and restoration until each operation has fresh remote
 identity and lifecycle fencing. An absent control cannot silently fall back to
 WSL or unguarded SSH.
@@ -1603,7 +1620,8 @@ The Windows WSL slice remains independently tested throughout this work.
 3. Remaining local work adds project settings, Console Panel, and broader
    command and accessibility surfaces.
 4. Remote POSIX host settings, explicit connect, KWT-owned prompts, tmux plus
-   optional Herdr/Zellij inventory, and attach-only presentation now ship.
+   optional Herdr/Zellij inventory, attach-only presentation, and one-shot
+   tmux/Herdr/Zellij creation now ship.
    Follow-on remote work adds identity-fenced lifecycle operations,
    managed-helper installation, transport reconnect, repair/open reconnect,
    worktrees, and remote Windows.

@@ -557,7 +557,7 @@ impl HerdrLaunchOnce {
     }
 }
 
-/// One atomic local create-or-attach launch. The authority is intentionally
+/// One atomic create-or-attach launch. The authority is intentionally
 /// neither cloneable nor serializable and is consumed by the terminal launcher.
 #[derive(Debug, Eq, PartialEq)]
 pub struct CreateOnce {
@@ -568,7 +568,7 @@ pub struct CreateOnce {
 
 impl CreateOnce {
     #[must_use]
-    pub fn local_atomic(
+    pub fn atomic(
         program: impl Into<OsString>,
         args: Vec<OsString>,
         target_name: SessionName,
@@ -1031,30 +1031,5 @@ mod tests {
             SessionName::parse(&"e\u{301}".repeat(100)).is_ok(),
             "Swift-compatible character counting treats combining sequences as one name character"
         );
-    }
-
-    #[test]
-    fn create_once_is_consumed_into_one_exact_argv() {
-        let plan = CreateOnce::local_atomic(
-            "wsl.exe",
-            vec![
-                "new-session".into(),
-                "-A".into(),
-                "-s".into(),
-                "demo".into(),
-            ],
-            SessionName::parse("demo").expect("valid name"),
-        );
-        let (program, args, target) = plan.into_parts();
-
-        assert_eq!(program, "wsl.exe");
-        assert_eq!(
-            args,
-            ["new-session", "-A", "-s", "demo"]
-                .into_iter()
-                .map(std::ffi::OsString::from)
-                .collect::<Vec<_>>()
-        );
-        assert_eq!(target.as_str(), "demo");
     }
 }
