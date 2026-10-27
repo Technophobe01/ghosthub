@@ -12,8 +12,8 @@ use crate::{
     KwtProjectAction, KwtProjectMutationRequest, KwtProjectMutationTask,
     KwtPullRequestImportRequest, KwtPullRequestItem, KwtRefresh, KwtRemovalCapture,
     KwtRemovalCaptureIntent, KwtState, KwtWorktreeOperation, KwtWorktreeOutcome, KwtWorktreeTarget,
-    KwtWorktreeTask, Mutex, Ordering, PendingCreation, PendingHerdrLifecycle, PendingKill,
-    PendingKwtCreation, PendingKwtRemoval, PendingPaste, PresentationKey, ProjectItem,
+    KwtWorktreeTask, LocalHerdrLifecycle, Mutex, Ordering, PendingCreation, PendingHerdrLifecycle,
+    PendingKill, PendingKwtCreation, PendingKwtRemoval, PendingPaste, PresentationKey, ProjectItem,
     PtyAdmissionAttacher, Published, REDUCED_COLOR_NOTICE, RecvTimeoutError, RefreshPresentation,
     RemoteActive, RemoteAttachmentReset, RemoteConstructiveReset, RemoteConstructiveState,
     RemoteConstructiveTarget, RemoteHerdrAttachRequest, RemoteHerdrCreateRequest,
@@ -100,6 +100,8 @@ pub(crate) struct Scene {
     /// shared cadence runs while any live scene wants them.
     pub(crate) inventory_polling_enabled: AtomicBool,
     pub(crate) navigation: Mutex<()>,
+    #[cfg(test)]
+    pub(crate) before_navigation_lock: Mutex<Option<Box<dyn FnOnce() + Send>>>,
     pub(crate) remote_active: Mutex<Option<RemoteActive>>,
     pub(crate) remote_retained: Mutex<RemoteRetainedPresentations>,
     pub(crate) worker: Mutex<WorkerState<TerminalWorker>>,
@@ -166,6 +168,8 @@ pub(crate) fn attach_scene(
         navigation_generation: AtomicU64::new(0),
         inventory_polling_enabled: AtomicBool::new(false),
         navigation: Mutex::new(()),
+        #[cfg(test)]
+        before_navigation_lock: Mutex::new(None),
         remote_active: Mutex::new(None),
         remote_retained: Mutex::new(RemoteRetainedPresentations::new()),
         worker: Mutex::new(WorkerState::new()),
@@ -285,6 +289,12 @@ pub(crate) fn detach_scene_locked(scene: &Scene) {
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
         .invalidate();
+    clear_active_presentation(scene);
+}
+
+/// Close only the presented client while holding the navigation and snapshot guards.
+/// Pending navigation belongs to the user and remains intact.
+pub(crate) fn clear_active_presentation(scene: &Scene) {
     scene
         .remote_active
         .lock()
@@ -312,7 +322,33 @@ pub(crate) fn detach_scene_locked(scene: &Scene) {
     } else {
         purge_queued_clipboard_writes(scene);
     }
-    restore_scene_inventory_state(scene);
+    // A queued launch already owns Attaching state; keep it visible so a
+    // later selection cancels the launch and releases its reservation.
+    if scene
+        .pending_creation
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .is_some()
+    {
+        return;
+    }
+    let pending = scene
+        .attachment
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .active()
+        .map(|active| WorkspaceContent::Attaching {
+            host_id: active.request.host_id.clone(),
+            endpoint: active.request.endpoint.name().to_owned(),
+            session: active.request.name.clone(),
+            kind: active.request.target.kind(),
+        });
+    // A preserved local request must remain visible to navigation supersession.
+    if let Some(pending) = pending {
+        set_scene_state(scene, pending);
+    } else {
+        restore_scene_inventory_state(scene);
+    }
 }
 
 /// Project the runtime's stored inventory content back into this scene.
@@ -441,6 +477,17 @@ impl NavigationFence<'_> {
 /// Returns the scene-closed cancellation error; the caller's operation
 /// never starts.
 pub(crate) fn lock_live_navigation(scene: &Scene) -> Result<NavigationFence<'_>, WorkspaceError> {
+    #[cfg(test)]
+    {
+        let before = scene
+            .before_navigation_lock
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
+        if let Some(before) = before {
+            before();
+        }
+    }
     let guard = scene
         .navigation
         .lock()
@@ -583,6 +630,7 @@ pub(crate) fn publish_remote_connection(
         }
         Err(error) => {
             let diagnostic = HostDiagnostic::new(error.kind(), error.to_string());
+            entry.herdr_recoveries.clear();
             cancel_remote_constructive(entry);
             cancel_remote_attachment(entry);
             let stale_context = entry.context.take();
@@ -603,6 +651,7 @@ pub(crate) fn publish_remote_connection(
     }
     drop(snapshot_write);
     drop(stale_presentations);
+    crate::remote_herdr::restore_pending(&scene.runtime, host_id);
     drop(publication);
     if let Some((host, snapshot, target)) = pending_reconciliation {
         reconcile_remote_constructive_after_connection(
@@ -1642,7 +1691,7 @@ pub(crate) fn capture_herdr_lifecycle(
     selection: &SessionSelection,
     action: HerdrLifecycleAction,
     generation: u64,
-) -> Result<PendingHerdrLifecycle, WorkspaceError> {
+) -> Result<LocalHerdrLifecycle, WorkspaceError> {
     require_local_host_id(selection.host_id())?;
     if selection.kind() != SessionKind::Herdr {
         return Err(WorkspaceError::new(
@@ -1690,7 +1739,7 @@ pub(crate) fn capture_herdr_lifecycle(
                 "Herdr's default session cannot be deleted",
             ));
         }
-        Ok(PendingHerdrLifecycle {
+        Ok(LocalHerdrLifecycle {
             generation,
             operation_id: next_operation_id(&scene.runtime),
             selection: selection.clone(),
@@ -6595,6 +6644,7 @@ pub(crate) fn publish_remote_worker(
     let (worker_generation, previous_worker) = workers.replace(worker);
     reconcile_active_worker_terminal_settings(&scene.runtime, &workers);
     let previous_remote = remote_active.replace(RemoteActive {
+        navigation_generation: scene.navigation_generation.load(Ordering::Acquire),
         key,
         selection: selection.clone(),
         worker_generation,
@@ -6694,6 +6744,9 @@ pub(crate) fn run_attach_over_remote(
             Ok(prepared) => prepared,
             Err(AttachFreshError::SceneClosed) => return,
             Err(error) => {
+                let Ok(_navigation) = lock_live_navigation(scene) else {
+                    return;
+                };
                 let snapshot_write = begin_snapshot_write(&scene.runtime);
                 let mut attachment = scene
                     .attachment
@@ -6711,7 +6764,7 @@ pub(crate) fn run_attach_over_remote(
                     | AttachFreshError::SessionChanged { error, .. } => error.to_string(),
                     AttachFreshError::SceneClosed => unreachable!("handled above"),
                 };
-                push_operation_event(scene, WorkspaceEvent::Error(message));
+                publish_cross_host_attachment_failure(scene, message);
                 drop(snapshot_write);
                 return;
             }
@@ -6751,22 +6804,23 @@ pub(crate) fn run_attach_over_remote(
     {
         attachment.clear_if_current(generation);
         drop(attachment);
-        push_operation_event(scene, WorkspaceEvent::Error(error.to_string()));
+        publish_cross_host_attachment_failure(scene, error.to_string());
         return;
     }
     let mut remote_active = scene
         .remote_active
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    let Some(active_remote) = remote_active.as_ref() else {
-        attachment.clear_if_current(generation);
-        return;
-    };
     let mut workers = scene
         .worker
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    if workers.generation() != active_remote.worker_generation {
+    // Lifecycle suppression may have closed the predecessor while this navigation waited.
+    let predecessor_matches = match remote_active.as_ref() {
+        Some(active) => workers.generation() == active.worker_generation,
+        None => workers.active().is_none(),
+    };
+    if !predecessor_matches {
         attachment.clear_if_current(generation);
         return;
     }
@@ -6805,6 +6859,19 @@ pub(crate) fn run_attach_over_remote(
         _ => {}
     }
     drop(snapshot_write);
+}
+
+// The caller holds navigation and snapshot guards through failure publication.
+fn publish_cross_host_attachment_failure(scene: &Scene, message: String) {
+    if scene
+        .remote_active
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .is_none()
+    {
+        restore_scene_inventory_state(scene);
+    }
+    push_operation_event(scene, WorkspaceEvent::Error(message));
 }
 
 pub(crate) fn run_retained_retry(scene: &Scene, retry: &RetainedRetry) {
@@ -7016,7 +7083,7 @@ pub(crate) fn merge_herdr_created_inventory(
 
 pub(crate) fn merge_herdr_lifecycle_inventory(
     scene: &Scene,
-    pending: &PendingHerdrLifecycle,
+    pending: &LocalHerdrLifecycle,
     snapshot: HostSnapshot,
     publication_generation: u64,
 ) -> Result<u64, WorkspaceError> {
@@ -7033,7 +7100,7 @@ pub(crate) fn merge_herdr_lifecycle_inventory(
 
 pub(crate) fn publish_herdr_lifecycle_response(
     scene: &Scene,
-    pending: &PendingHerdrLifecycle,
+    pending: &LocalHerdrLifecycle,
     record: session::HerdrSessionRecord,
 ) -> Result<u64, WorkspaceError> {
     let publication_generation = reserve_constructive_inventory(&scene.runtime);
@@ -7064,7 +7131,7 @@ pub(crate) fn publish_herdr_lifecycle_response(
 
 pub(crate) fn reconcile_herdr_lifecycle_inventory(
     scene: &Scene,
-    pending: &PendingHerdrLifecycle,
+    pending: &LocalHerdrLifecycle,
 ) -> Result<HostSnapshot, WorkspaceError> {
     let publication_generation = reserve_constructive_inventory(&scene.runtime);
     let snapshot = match pending.host.discover(&PtyAdmissionAttacher::new()) {

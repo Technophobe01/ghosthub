@@ -182,6 +182,7 @@ fn consumed_remote_launch_failure_remains_pending_for_reconciliation() {
                     target: target.clone(),
                 }),
                 attachment_attempts: Vec::new(),
+                herdr_recoveries: Vec::new(),
                 generation: 7,
             },
         );
@@ -283,6 +284,7 @@ fn queued_remote_attachment_recaptures_newer_same_connection_inventory() {
                 cancellation: None,
                 constructive_cancellation: None,
                 attachment_attempts: Vec::new(),
+                herdr_recoveries: Vec::new(),
                 generation: 7,
             },
         );
@@ -4816,6 +4818,89 @@ fn herdr_workspace_fixture() -> (Workspace, Arc<ManualRefreshRuntime>) {
 }
 
 #[test]
+fn local_switch_waiting_on_navigation_survives_remote_suppression() {
+    let (workspace, _runtime) = herdr_workspace_fixture();
+    workspace
+        .scene
+        .runtime
+        .host
+        .lock()
+        .unwrap()
+        .as_mut()
+        .unwrap()
+        .value
+        .host = LocalHost::wsl(
+        LocalConfig::with_distro("Ubuntu").unwrap(),
+        Arc::new(RefusingRunner) as SharedCommandRunner,
+        WslExecutable::from_absolute(r"C:\Windows\System32\wsl.exe").unwrap(),
+    );
+    let remote = RemoteTmuxSnapshot::test_fixture(
+        "studio.example",
+        TEST_REMOTE_ROUTE,
+        7,
+        Vec::new(),
+        HerdrInventory::Unavailable,
+        ZellijInventory::Unavailable,
+    );
+    *workspace.scene.remote_active.lock().unwrap() = Some(RemoteActive {
+        navigation_generation: 0,
+        key: RemotePresentationKey {
+            host_id: "ssh:studio".to_owned(),
+            endpoint: "studio.example".to_owned(),
+            route_identity: TEST_REMOTE_ROUTE.to_owned(),
+            lease_generation: 7,
+            session_identity: RemoteSessionIdentity::Herdr {
+                name: "guarded".to_owned(),
+                is_default: false,
+                session_directory: "/srv/herdr/guarded".to_owned(),
+                socket_path: "/srv/herdr/guarded/herdr.sock".to_owned(),
+            },
+        },
+        selection: SessionSelection::herdr("ssh:studio", "studio.example", "guarded"),
+        worker_generation: 1,
+        lease: remote.lease().clone(),
+        presentation_id: 1,
+        term: AttachTerm::Xterm256Color,
+        retainable: false,
+        identity_mismatch_marker: None,
+    });
+    // Hold the same lane and navigation fence as Stop's suppression callback.
+    // The lane also keeps this routing test from launching a real WSL client.
+    let operation = workspace.scene.runtime.session_operations.lock().unwrap();
+    let navigation = lock_live_navigation(&workspace.scene).unwrap();
+    let (entered_tx, entered_rx) = mpsc::sync_channel(1);
+    let (resume_tx, resume_rx) = mpsc::sync_channel(1);
+    *workspace.scene.before_navigation_lock.lock().unwrap() = Some(Box::new(move || {
+        entered_tx.send(()).unwrap();
+        resume_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+    }));
+    let switching = workspace.clone();
+    let (done_tx, done_rx) = mpsc::sync_channel(1);
+    let switcher = thread::spawn(move || {
+        done_tx
+            .send(switching.switch_session(&SessionSelection::new("wsl", "Ubuntu", "work")))
+            .unwrap();
+    });
+    entered_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+    {
+        let _snapshot = begin_snapshot_write(&workspace.scene.runtime);
+        crate::scene::clear_active_presentation(&workspace.scene);
+    }
+    drop(navigation);
+    resume_tx.send(()).unwrap();
+    let result = done_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+    switcher.join().unwrap();
+    result.expect("the selected local session is accepted after its remote predecessor closes");
+    assert!(matches!(
+        workspace.snapshot().content(),
+        WorkspaceContent::Attaching { host_id, endpoint, session, kind: SessionKind::Tmux }
+            if host_id == "wsl" && endpoint == "Ubuntu" && session == "work"
+    ));
+    workspace.close();
+    drop(operation);
+}
+
+#[test]
 fn successful_refresh_projects_herdr_without_changing_tmux_readiness() {
     let (workspace, _runtime) = herdr_workspace_fixture();
 
@@ -4986,6 +5071,9 @@ fn in_flight_herdr_lifecycle_is_visible_and_rejects_duplicates() {
             .expect("pending lifecycle")
             .take()
             .expect("pending stop");
+        let PendingHerdrLifecycle::Local(pending) = pending else {
+            panic!("expected local lifecycle");
+        };
         assert!(lifecycle.start(&pending));
         pending.generation
     };
@@ -5263,6 +5351,9 @@ fn a_herdr_stop_revokes_restarts_and_the_delayed_recovery_re_drives_them() {
             .expect("pending lifecycle")
             .take()
             .expect("pending stop");
+        let PendingHerdrLifecycle::Local(pending) = pending else {
+            panic!("expected local lifecycle");
+        };
         assert!(lifecycle.start(&pending));
         pending
     };
@@ -5333,6 +5424,9 @@ fn uncertain_lifecycle_stays_fenced_until_fresh_inventory_arrives() {
             .expect("pending lifecycle")
             .take()
             .expect("pending stop");
+        let PendingHerdrLifecycle::Local(pending) = pending else {
+            panic!("expected local lifecycle");
+        };
         assert!(lifecycle.start(&pending));
         pending
     };
@@ -5435,6 +5529,9 @@ fn ordinary_refresh_cannot_reconcile_an_active_lifecycle_operation() {
             .expect("pending lifecycle")
             .take()
             .expect("pending stop");
+        let PendingHerdrLifecycle::Local(pending) = pending else {
+            panic!("expected local lifecycle");
+        };
         assert!(lifecycle.start(&pending));
     }
     let snapshot = workspace
@@ -5508,6 +5605,9 @@ fn fresh_inventory_supersedes_a_synthetic_lifecycle_response() {
         .expect("lifecycle state")
         .clone()
         .expect("pending stop");
+    let PendingHerdrLifecycle::Local(pending) = pending else {
+        panic!("expected local lifecycle");
+    };
     let stopped = session::HerdrSessionRecord::new(
         "default",
         true,
@@ -6973,6 +7073,7 @@ fn cancelled_remote_connection_cannot_publish_a_late_failure() {
                 cancellation: Some(cancellation.clone()),
                 constructive_cancellation: None,
                 attachment_attempts: Vec::new(),
+                herdr_recoveries: Vec::new(),
                 generation: 7,
             },
         );
@@ -7031,6 +7132,7 @@ fn remote_cancellation_waits_for_inventory_publication() {
                 cancellation: Some(cancellation.clone()),
                 constructive_cancellation: None,
                 attachment_attempts: Vec::new(),
+                herdr_recoveries: Vec::new(),
                 generation: 7,
             },
         );
@@ -7136,6 +7238,7 @@ fn stale_lease_exit_cannot_cancel_its_replacement_connection() {
                 cancellation: Some(replacement.clone()),
                 constructive_cancellation: None,
                 attachment_attempts: Vec::new(),
+                herdr_recoveries: Vec::new(),
                 generation: 8,
             },
         );
@@ -7195,6 +7298,7 @@ fn newer_navigation_cancels_a_queued_remote_attachment() {
                 context: None,
                 cancellation: None,
                 constructive_cancellation: None,
+                herdr_recoveries: Vec::new(),
                 attachment_attempts: vec![RemoteAttachmentAttempt {
                     scene: workspace.scene.id,
                     navigation_generation: 7,
@@ -7258,6 +7362,7 @@ fn navigation_in_one_scene_leaves_other_scenes_remote_attempts_in_flight() {
                 context: None,
                 cancellation: None,
                 constructive_cancellation: None,
+                herdr_recoveries: Vec::new(),
                 attachment_attempts: vec![
                     RemoteAttachmentAttempt {
                         scene: a.scene.id,
@@ -7356,6 +7461,7 @@ fn concurrent_scene_attachment_attempts_coexist_on_one_host() {
                 cancellation: None,
                 constructive_cancellation: None,
                 attachment_attempts: Vec::new(),
+                herdr_recoveries: Vec::new(),
                 generation: 7,
             },
         );
@@ -7409,10 +7515,8 @@ fn concurrent_scene_attachment_attempts_coexist_on_one_host() {
     // A finished attempt clears only its own registration.
     clear_remote_attachment_registration(&a.scene.runtime, "ssh:studio", 13);
     let entries = a.scene.runtime.remote_hosts.lock().expect("remote hosts");
-    let attempts = &entries
-        .get("ssh:studio")
-        .expect("remote entry")
-        .attachment_attempts;
+    let entry = entries.get("ssh:studio").expect("remote entry");
+    let attempts = &entry.attachment_attempts;
     assert_eq!(attempts.len(), 1);
     assert_eq!(attempts[0].navigation_generation, 12);
 }
@@ -7450,6 +7554,7 @@ fn navigation_in_another_scene_leaves_remote_construction_active() {
                     target: remote_zellij_target("review"),
                 }),
                 attachment_attempts: Vec::new(),
+                herdr_recoveries: Vec::new(),
                 generation: 1,
             },
         );
@@ -7511,6 +7616,7 @@ fn superseded_remote_attachment_cannot_cross_the_launch_fence() {
                 context: None,
                 cancellation: None,
                 constructive_cancellation: None,
+                herdr_recoveries: Vec::new(),
                 attachment_attempts: vec![RemoteAttachmentAttempt {
                     scene: workspace.scene.id,
                     navigation_generation: 7,
@@ -7610,6 +7716,7 @@ fn refresh_after_remote_launch_transfers_inventory_reconciliation() {
                     target: target.clone(),
                 }),
                 attachment_attempts: Vec::new(),
+                herdr_recoveries: Vec::new(),
                 generation: 7,
             },
         );
@@ -7677,6 +7784,7 @@ fn navigation_cancels_only_prelaunch_remote_construction() {
                     target: remote_zellij_target("review"),
                 }),
                 attachment_attempts: Vec::new(),
+                herdr_recoveries: Vec::new(),
                 generation: 1,
             },
         );
@@ -7795,6 +7903,7 @@ fn concurrent_remote_inventory_publication_settles_pending_reconciliation() {
                     target.clone(),
                 )),
                 attachment_attempts: Vec::new(),
+                herdr_recoveries: Vec::new(),
                 generation: 7,
             },
         );
@@ -7915,6 +8024,7 @@ fn stale_remote_inventory_cannot_overwrite_the_published_generation() {
                 cancellation: None,
                 constructive_cancellation: None,
                 attachment_attempts: Vec::new(),
+                herdr_recoveries: Vec::new(),
                 generation: 7,
             },
         );
@@ -8018,6 +8128,7 @@ fn remote_kill_refresh_fixture() -> (Workspace, RemoteTmuxAttachRequest) {
                 cancellation: None,
                 constructive_cancellation: None,
                 attachment_attempts: Vec::new(),
+                herdr_recoveries: Vec::new(),
                 generation: 7,
             },
         );
@@ -8204,6 +8315,7 @@ fn display_only_ssh_host_edits_preserve_runtime_and_selection() {
                     target: remote_zellij_target("review"),
                 }),
                 attachment_attempts: Vec::new(),
+                herdr_recoveries: Vec::new(),
                 generation: 7,
             },
         );
@@ -8291,6 +8403,7 @@ fn connection_changing_ssh_host_edits_disconnect_and_move_selection() {
                     target: remote_zellij_target("review"),
                 }),
                 attachment_attempts: Vec::new(),
+                herdr_recoveries: Vec::new(),
                 generation: 7,
             },
         );
@@ -8691,11 +8804,13 @@ fn stale_generation_remote_publication_cannot_touch_another_scenes_presentation(
                 cancellation: None,
                 constructive_cancellation: None,
                 attachment_attempts: Vec::new(),
+                herdr_recoveries: Vec::new(),
                 generation: 8,
             },
         );
     // Scene B presents the remote session keyed to the current connection.
     *b.scene.remote_active.lock().expect("scene B remote active") = Some(RemoteActive {
+        navigation_generation: 0,
         key: RemotePresentationKey {
             host_id: "ssh:studio".to_owned(),
             endpoint: "studio.example".to_owned(),
@@ -8958,7 +9073,7 @@ fn completed_herdr_lifecycle_drops_matching_confirmations_in_every_scene() {
             "/srv/herdr/sessions/herdr.sock",
         )
     };
-    let pending = |scene: &Scene, name: &str, operation_id| PendingHerdrLifecycle {
+    let pending = |scene: &Scene, name: &str, operation_id| LocalHerdrLifecycle {
         generation: scene.herdr_lifecycle_generation.load(Ordering::Acquire),
         operation_id,
         selection: SessionSelection::herdr("wsl", "Ubuntu", name),
@@ -8972,11 +9087,15 @@ fn completed_herdr_lifecycle_drops_matching_confirmations_in_every_scene() {
     *b.scene
         .pending_herdr_lifecycle
         .lock()
-        .expect("scene B pending lifecycle") = Some(pending(&b.scene, "agents", 1));
+        .expect("scene B pending lifecycle") = Some(PendingHerdrLifecycle::Local(Box::new(
+        pending(&b.scene, "agents", 1),
+    )));
     *c.scene
         .pending_herdr_lifecycle
         .lock()
-        .expect("scene C pending lifecycle") = Some(pending(&c.scene, "other", 2));
+        .expect("scene C pending lifecycle") = Some(PendingHerdrLifecycle::Local(Box::new(
+        pending(&c.scene, "other", 2),
+    )));
     assert!(b.herdr_lifecycle_confirmation().is_some());
     let c_revision = c.snapshot().revision();
 
@@ -10216,6 +10335,7 @@ fn queued_remote_construction_recaptures_newer_same_connection_inventory() {
                     target: remote_zellij_target("review"),
                 }),
                 attachment_attempts: Vec::new(),
+                herdr_recoveries: Vec::new(),
                 generation: 7,
             },
         );
@@ -10378,6 +10498,7 @@ fn queued_remote_tmux_creation_stops_when_scene_closes() {
             cancellation: None,
             constructive_cancellation: None,
             attachment_attempts: Vec::new(),
+            herdr_recoveries: Vec::new(),
             generation: 7,
         },
     );
@@ -10483,6 +10604,7 @@ fn queued_zellij_construction_consults_recaptured_inventory_before_launching() {
                     target: remote_zellij_target("review"),
                 }),
                 attachment_attempts: Vec::new(),
+                herdr_recoveries: Vec::new(),
                 generation: 7,
             },
         );
@@ -10649,6 +10771,7 @@ fn queued_herdr_restart_revalidates_the_stopped_record_before_launching() {
                     target: remote_herdr_target("agents"),
                 }),
                 attachment_attempts: Vec::new(),
+                herdr_recoveries: Vec::new(),
                 generation: 7,
             },
         );
@@ -10814,6 +10937,7 @@ fn queued_construction_acquires_the_lane_before_recapturing() {
                     target: remote_zellij_target("review"),
                 }),
                 attachment_attempts: Vec::new(),
+                herdr_recoveries: Vec::new(),
                 generation: 7,
             },
         );
@@ -11817,6 +11941,7 @@ fn switching_away_from_a_non_retainable_session_retires_its_clipboard_authority(
         .expect("worker")
         .publish(previous);
     *workspace.scene.remote_active.lock().expect("remote active") = Some(RemoteActive {
+        navigation_generation: 0,
         key: RemotePresentationKey {
             host_id: "ssh:studio".to_owned(),
             endpoint: "studio.example".to_owned(),
@@ -11878,6 +12003,7 @@ fn a_remote_terminal_exit_retires_its_clipboard_authority() {
         ZellijInventory::Unavailable,
     );
     *workspace.scene.remote_active.lock().expect("remote active") = Some(RemoteActive {
+        navigation_generation: 0,
         key: RemotePresentationKey {
             host_id: "ssh:studio".to_owned(),
             endpoint: "studio.example".to_owned(),
@@ -12209,6 +12335,7 @@ fn removing_a_host_drops_other_scenes_retained_presentations() {
         .entries
         .push(RemoteRetainedPresentation {
             active: RemoteActive {
+                navigation_generation: 0,
                 key: RemotePresentationKey {
                     host_id: "ssh:studio".to_owned(),
                     endpoint: "studio.example".to_owned(),
@@ -12229,6 +12356,7 @@ fn removing_a_host_drops_other_scenes_retained_presentations() {
 
     // The non-initiating scene also presents the doomed host actively.
     *other.scene.remote_active.lock().expect("remote active") = Some(RemoteActive {
+        navigation_generation: 0,
         key: RemotePresentationKey {
             host_id: "ssh:studio".to_owned(),
             endpoint: "studio.example".to_owned(),
@@ -12336,6 +12464,7 @@ fn removing_the_initiating_scenes_own_host_detaches_under_the_held_fence() {
         ZellijInventory::Unavailable,
     );
     *workspace.scene.remote_active.lock().expect("remote active") = Some(RemoteActive {
+        navigation_generation: 0,
         key: RemotePresentationKey {
             host_id: "ssh:studio".to_owned(),
             endpoint: "studio.example".to_owned(),
@@ -12408,6 +12537,7 @@ fn connect_never_holds_navigation_while_waiting_on_publication() {
                 cancellation: None,
                 constructive_cancellation: None,
                 attachment_attempts: Vec::new(),
+                herdr_recoveries: Vec::new(),
                 generation: 8,
             },
         );
@@ -12539,6 +12669,7 @@ fn cancellations_are_rejected_from_a_closed_scene() {
                 cancellation: Some(token.clone()),
                 constructive_cancellation: None,
                 attachment_attempts: Vec::new(),
+                herdr_recoveries: Vec::new(),
                 generation: 3,
             },
         );
@@ -13360,6 +13491,7 @@ fn removal_waits_for_a_scenes_navigation_before_judging_its_presentation() {
     thread::sleep(Duration::from_millis(150));
 
     *other.scene.remote_active.lock().expect("remote active") = Some(RemoteActive {
+        navigation_generation: 0,
         key: RemotePresentationKey {
             host_id: "ssh:studio".to_owned(),
             endpoint: "studio.example".to_owned(),
@@ -14458,6 +14590,7 @@ fn closing_a_scene_releases_worker_presentations_attempts_and_lease() {
                 cancellation: None,
                 constructive_cancellation: None,
                 attachment_attempts: Vec::new(),
+                herdr_recoveries: Vec::new(),
                 generation: 8,
             },
         );
@@ -14473,6 +14606,7 @@ fn closing_a_scene_releases_worker_presentations_attempts_and_lease() {
     )
     .expect("register scene B's attach attempt");
     *b.scene.remote_active.lock().expect("remote active") = Some(RemoteActive {
+        navigation_generation: 0,
         key: RemotePresentationKey {
             host_id: "ssh:studio".to_owned(),
             endpoint: "studio.example".to_owned(),
@@ -14531,6 +14665,7 @@ fn closing_a_scene_releases_worker_presentations_attempts_and_lease() {
         .entries
         .push(RemoteRetainedPresentation {
             active: RemoteActive {
+                navigation_generation: 0,
                 key: RemotePresentationKey {
                     host_id: "ssh:studio".to_owned(),
                     endpoint: "studio.example".to_owned(),
@@ -14976,7 +15111,7 @@ fn herdr_stop_suppression_reaches_every_scene_and_restores_to_owners() {
         "/tmp/herdr/review",
         "/tmp/herdr/review/herdr.sock",
     );
-    let pending = PendingHerdrLifecycle {
+    let pending = LocalHerdrLifecycle {
         generation: a.scene.herdr_lifecycle_generation.load(Ordering::Acquire),
         operation_id: 1,
         selection: SessionSelection::herdr("wsl", "Ubuntu", "work"),
@@ -15148,7 +15283,7 @@ fn herdr_failure_restore_cannot_resurrect_a_presentation_in_a_closed_scene() {
         "/tmp/herdr/review",
         "/tmp/herdr/review/herdr.sock",
     );
-    let pending = PendingHerdrLifecycle {
+    let pending = LocalHerdrLifecycle {
         generation: workspace
             .scene
             .herdr_lifecycle_generation

@@ -33,6 +33,7 @@ use terminal::{
 };
 
 mod pump;
+mod remote_herdr;
 mod runtime;
 mod scene;
 
@@ -1886,6 +1887,8 @@ struct RemoteEntry {
     /// Supersede and cancel fences act per scene; only connection-authority
     /// changes cancel every scene's attempt at once.
     attachment_attempts: Vec<RemoteAttachmentAttempt>,
+    /// Rejected Stop recoveries awaiting this host's in-flight reconnect.
+    herdr_recoveries: Vec<remote_herdr::Recovery>,
     generation: u64,
 }
 
@@ -1931,6 +1934,8 @@ struct RemoteAttachmentAttempt {
 }
 
 struct RemoteActive {
+    /// Navigation that installed or reselected this presentation.
+    navigation_generation: u64,
     key: RemotePresentationKey,
     selection: SessionSelection,
     worker_generation: u64,
@@ -2506,7 +2511,43 @@ enum KillTarget {
 }
 
 #[derive(Clone)]
-struct PendingHerdrLifecycle {
+enum PendingHerdrLifecycle {
+    Local(Box<LocalHerdrLifecycle>),
+    Remote(Box<remote_herdr::RemoteHerdrLifecycle>),
+}
+
+impl PendingHerdrLifecycle {
+    fn generation(&self) -> u64 {
+        match self {
+            Self::Local(pending) => pending.generation,
+            Self::Remote(pending) => pending.generation,
+        }
+    }
+
+    fn operation_id(&self) -> u64 {
+        match self {
+            Self::Local(pending) => pending.operation_id,
+            Self::Remote(pending) => pending.operation_id,
+        }
+    }
+
+    fn selection(&self) -> &SessionSelection {
+        match self {
+            Self::Local(pending) => &pending.selection,
+            Self::Remote(pending) => &pending.request.selection,
+        }
+    }
+
+    fn action(&self) -> HerdrLifecycleAction {
+        match self {
+            Self::Local(pending) => pending.action,
+            Self::Remote(pending) => pending.action,
+        }
+    }
+}
+
+#[derive(Clone)]
+struct LocalHerdrLifecycle {
     /// Confirmation fence value from the owning scene's
     /// `herdr_lifecycle_generation`; only meaningful inside that scene.
     generation: u64,
@@ -2522,7 +2563,7 @@ struct PendingHerdrLifecycle {
     record: session::HerdrSessionRecord,
 }
 
-impl PendingHerdrLifecycle {
+impl LocalHerdrLifecycle {
     fn key(&self) -> HerdrOperationKey {
         HerdrOperationKey {
             endpoint: self.endpoint.clone(),
@@ -2563,6 +2604,7 @@ struct HerdrLifecycleReconciliation {
 struct HerdrLifecycleState {
     in_flight: Vec<InFlightHerdrLifecycle>,
     launches: Vec<HerdrOperationKey>,
+    remote: Vec<remote_herdr::RemoteHerdrLifecycle>,
 }
 
 impl HerdrLifecycleState {
@@ -2591,7 +2633,7 @@ impl HerdrLifecycleState {
             .map(|operation| operation.action)
     }
 
-    fn start(&mut self, pending: &PendingHerdrLifecycle) -> bool {
+    fn start(&mut self, pending: &LocalHerdrLifecycle) -> bool {
         let key = pending.key();
         if self.in_flight_action(&key).is_some() {
             return false;
@@ -2607,15 +2649,17 @@ impl HerdrLifecycleState {
     }
 
     fn finish(&mut self, operation_id: u64) -> bool {
-        let previous_len = self.in_flight.len();
+        let previous_len = self.in_flight.len() + self.remote.len();
         self.in_flight
             .retain(|operation| operation.operation_id != operation_id);
-        self.in_flight.len() != previous_len
+        self.remote
+            .retain(|operation| operation.operation_id != operation_id);
+        self.in_flight.len() + self.remote.len() != previous_len
     }
 
     fn mark_uncertain(
         &mut self,
-        pending: &PendingHerdrLifecycle,
+        pending: &LocalHerdrLifecycle,
         reconcile_after_generation: u64,
         presentations: Vec<SuppressedHerdrPresentation>,
     ) -> bool {
@@ -4106,6 +4150,7 @@ impl Workspace {
                             cancellation: None,
                             constructive_cancellation: None,
                             attachment_attempts: Vec::new(),
+                            herdr_recoveries: Vec::new(),
                             generation: 0,
                         },
                     );
@@ -4766,6 +4811,7 @@ impl Workspace {
                     .filter(|entry| entry.generation == generation)
                     .map(|entry| {
                         entry.cancellation.take();
+                        entry.herdr_recoveries.clear();
                         entry.context.take()
                     });
                 if stale_context.is_some() {
@@ -4816,6 +4862,7 @@ impl Workspace {
                     .unwrap_or_else(std::sync::PoisonError::into_inner);
                 entries.get_mut(id).and_then(|entry| {
                     let cancellation = entry.cancellation.take()?;
+                    entry.herdr_recoveries.clear();
                     entry.generation = entry.generation.wrapping_add(1).max(1);
                     Some((cancellation, entry.context.take()))
                 })
@@ -4979,6 +5026,7 @@ impl Workspace {
                         cancellation: None,
                         constructive_cancellation: None,
                         attachment_attempts: Vec::new(),
+                        herdr_recoveries: Vec::new(),
                         generation: 0,
                     },
                 );
@@ -5912,6 +5960,13 @@ impl Workspace {
     /// Returns an error if the requested session is absent from the latest
     /// inventory or the replacement attachment cannot be started.
     pub fn switch_session(&self, selection: &SessionSelection) -> Result<(), WorkspaceError> {
+        if selection.kind() == SessionKind::Herdr
+            && herdr_operation_pending_for_selection(&self.scene.runtime, selection)
+        {
+            return Err(WorkspaceError::new(
+                "this Herdr session is already starting or changing lifecycle",
+            ));
+        }
         if self.is_remote_host(selection.host_id()) {
             let _navigation = lock_live_navigation(&self.scene)?;
             let navigation_generation = self.begin_navigation();
@@ -5945,6 +6000,8 @@ impl Workspace {
             let request = capture_remote_tmux_attach_request(&self.scene.runtime, selection)?;
             return self.start_remote_tmux_attachment(request, navigation_generation);
         }
+        // Suppression changes the active presentation under this same fence.
+        let _navigation = lock_live_navigation(&self.scene)?;
         if self
             .scene
             .remote_active
@@ -5952,7 +6009,6 @@ impl Workspace {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .is_some()
         {
-            let _navigation = lock_live_navigation(&self.scene)?;
             let (key, request) = self.navigation_target(selection)?;
             let navigation_generation = self.begin_navigation();
             self.scene
@@ -5971,7 +6027,6 @@ impl Workspace {
             return self.start_attachment_over_remote(request, navigation_generation);
         }
         let _snapshot_write = begin_snapshot_write(&self.scene.runtime);
-        let _navigation = lock_live_navigation(&self.scene)?;
         self.switch_session_locked(selection)
     }
 
@@ -6068,6 +6123,7 @@ impl Workspace {
                 "the active remote presentation changed while selecting it",
             ));
         };
+        active.navigation_generation = self.scene.navigation_generation.load(Ordering::Acquire);
         if current_key.is_some_and(|key| active.key == *key) && active.selection != *selection {
             active.selection = selection.clone();
             set_scene_state(
@@ -6654,6 +6710,11 @@ impl Workspace {
         selection: &SessionSelection,
     ) -> Result<(), WorkspaceError> {
         let navigation = lock_live_navigation(&self.scene)?;
+        if herdr_operation_pending_for_selection(&self.scene.runtime, selection) {
+            return Err(WorkspaceError::new(
+                "this Herdr session is already starting or changing lifecycle",
+            ));
+        }
         if self.is_remote_host(selection.host_id()) {
             let request = capture_remote_herdr_restart_request(&self.scene.runtime, selection)?;
             return self.start_remote_herdr_launch(request, navigation);
@@ -7561,7 +7622,21 @@ impl Workspace {
         let _snapshot_write = begin_snapshot_write(&self.scene.runtime);
         let generation = invalidate_pending_herdr_lifecycle(&self.scene);
         self.cancel_session_kill();
-        let pending = capture_herdr_lifecycle(&self.scene, selection, action, generation)?;
+        let pending = if self.is_remote_host(selection.host_id()) {
+            PendingHerdrLifecycle::Remote(Box::new(remote_herdr::capture(
+                &self.scene,
+                selection,
+                action,
+                generation,
+            )?))
+        } else {
+            PendingHerdrLifecycle::Local(Box::new(capture_herdr_lifecycle(
+                &self.scene,
+                selection,
+                action,
+                generation,
+            )?))
+        };
         let lifecycle = self
             .scene
             .runtime
@@ -7573,12 +7648,21 @@ impl Workspace {
             .pending_herdr_lifecycle
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if lifecycle.in_flight_action(&pending.key()).is_some() {
+        if match &pending {
+            PendingHerdrLifecycle::Local(pending) => {
+                lifecycle.in_flight_action(&pending.key()).is_some()
+            }
+            PendingHerdrLifecycle::Remote(pending) => lifecycle
+                .remote
+                .iter()
+                .any(|other| other.request.selection == pending.request.selection),
+        } {
             return Err(WorkspaceError::new(
                 "a lifecycle action is already running for this Herdr session",
             ));
         }
-        if lifecycle.launch_pending(&pending.key()) {
+        if matches!(&pending, PendingHerdrLifecycle::Local(pending) if lifecycle.launch_pending(&pending.key()))
+        {
             return Err(WorkspaceError::new("this Herdr session is still starting"));
         }
         if self
@@ -7609,10 +7693,10 @@ impl Workspace {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .as_ref()
-            .filter(|pending| pending.generation == generation)
+            .filter(|pending| pending.generation() == generation)
             .map(|pending| HerdrLifecycleConfirmation {
-                selection: pending.selection.clone(),
-                action: pending.action,
+                selection: pending.selection().clone(),
+                action: pending.action(),
             })
     }
 
@@ -7649,17 +7733,32 @@ impl Workspace {
             .scene
             .herdr_lifecycle_generation
             .load(Ordering::Acquire)
-            != pending.generation
+            != pending.generation()
         {
             return Err(WorkspaceError::new(
                 "Herdr lifecycle confirmation is no longer current",
             ));
         }
-        if let Err(error) = require_host_session_actions(&self.scene.runtime, &pending.selection) {
+        if let Err(error) = require_host_session_actions(&self.scene.runtime, pending.selection()) {
             *pending_slot = Some(pending);
             return Err(error);
         }
-        if !lifecycle.start(&pending) {
+        let started = match &pending {
+            PendingHerdrLifecycle::Local(pending) => lifecycle.start(pending),
+            PendingHerdrLifecycle::Remote(pending) => {
+                if lifecycle
+                    .remote
+                    .iter()
+                    .any(|other| other.request.selection == pending.request.selection)
+                {
+                    false
+                } else {
+                    lifecycle.remote.push(pending.as_ref().clone());
+                    true
+                }
+            }
+        };
+        if !started {
             return Err(WorkspaceError::new(
                 "a lifecycle action is already running for this Herdr session",
             ));
@@ -7670,8 +7769,11 @@ impl Workspace {
         let workspace = self.clone();
         let retry = pending.clone();
         if let Err(error) = thread::Builder::new()
-            .name(format!("ghosthub-herdr-{}", pending.action.command()))
-            .spawn(move || run_herdr_lifecycle(&workspace, &pending))
+            .name(format!("ghosthub-herdr-{}", pending.action().command()))
+            .spawn(move || match pending {
+                PendingHerdrLifecycle::Local(pending) => run_herdr_lifecycle(&workspace, &pending),
+                PendingHerdrLifecycle::Remote(pending) => remote_herdr::run(&workspace, &pending),
+            })
         {
             let mut lifecycle = self
                 .scene
@@ -7684,12 +7786,12 @@ impl Workspace {
                 .pending_herdr_lifecycle
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            lifecycle.finish(retry.operation_id);
+            lifecycle.finish(retry.operation_id());
             if self
                 .scene
                 .herdr_lifecycle_generation
                 .load(Ordering::Acquire)
-                == retry.generation
+                == retry.generation()
                 && pending_slot.is_none()
             {
                 *pending_slot = Some(retry);
@@ -7795,20 +7897,33 @@ impl Workspace {
             },
             |selection| selection == &request.selection,
         );
+        self.close_remote_presentations(matches_key);
+    }
+
+    fn close_remote_presentations(
+        &self,
+        matches_key: impl Fn(&RemotePresentationKey) -> bool,
+    ) -> Vec<(SceneId, u64)> {
+        let mut closed = Vec::new();
         for_each_scene(&self.scene.runtime, |scene| {
             let _snapshot_write = begin_snapshot_write(&scene.runtime);
             let _navigation = scene
                 .navigation
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            let active_matches = scene
+            let active_navigation = scene
                 .remote_active
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .as_ref()
-                .is_some_and(|active| matches_key(&active.key));
-            if active_matches {
-                detach_scene_locked(scene);
+                .filter(|active| matches_key(&active.key))
+                .map(|active| active.navigation_generation);
+            if let Some(active_navigation) = active_navigation {
+                // Closing this client must not cancel a newer destination waiting on the lane.
+                scene::clear_active_presentation(scene);
+                if scene.navigation_generation.load(Ordering::Acquire) == active_navigation {
+                    closed.push((scene.id, active_navigation));
+                }
             }
             let mut retained = scene
                 .remote_retained
@@ -7822,6 +7937,7 @@ impl Workspace {
                 bump_scene_revision(scene);
             }
         });
+        closed
     }
 
     fn finish_session_kill(&self, target: &LiveSessionTarget) {
@@ -8255,9 +8371,11 @@ impl Workspace {
             &self.scene.runtime,
             |scene| &scene.pending_herdr_lifecycle,
             |pending| {
-                pending.endpoint == *endpoint
-                    && pending.runtime == *runtime
-                    && pending.record.name() == record.name()
+                matches!(pending, PendingHerdrLifecycle::Local(pending) if
+                    pending.endpoint == *endpoint
+                        && pending.runtime == *runtime
+                        && pending.record.name() == record.name()
+                )
             },
         );
         for_each_scene(&self.scene.runtime, |scene| {
@@ -8316,7 +8434,7 @@ impl Workspace {
     /// suppression.
     fn close_herdr_presentations(
         &self,
-        pending: &PendingHerdrLifecycle,
+        pending: &LocalHerdrLifecycle,
     ) -> Vec<SuppressedHerdrPresentation> {
         live_scenes(&self.scene.runtime)
             .into_iter()
@@ -8326,7 +8444,7 @@ impl Workspace {
 
     fn close_herdr_presentations_in_scene(
         &self,
-        pending: &PendingHerdrLifecycle,
+        pending: &LocalHerdrLifecycle,
     ) -> Option<SuppressedHerdrPresentation> {
         let _snapshot_write = begin_snapshot_write(&self.scene.runtime);
         let _navigation = self
@@ -9318,7 +9436,7 @@ fn lock_session_operations<'a>(
     }
 }
 
-fn run_herdr_lifecycle(workspace: &Workspace, pending: &PendingHerdrLifecycle) {
+fn run_herdr_lifecycle(workspace: &Workspace, pending: &LocalHerdrLifecycle) {
     let _operation = workspace
         .scene
         .runtime
@@ -9369,7 +9487,7 @@ fn run_herdr_lifecycle(workspace: &Workspace, pending: &PendingHerdrLifecycle) {
 
 fn reconcile_herdr_lifecycle_failure(
     workspace: &Workspace,
-    pending: &PendingHerdrLifecycle,
+    pending: &LocalHerdrLifecycle,
     operation_error: String,
     suppressed: Vec<SuppressedHerdrPresentation>,
 ) {
@@ -9505,10 +9623,7 @@ fn created_session(
         .cloned()
 }
 
-fn herdr_session_is_still_running(
-    snapshot: &HostSnapshot,
-    pending: &PendingHerdrLifecycle,
-) -> bool {
+fn herdr_session_is_still_running(snapshot: &HostSnapshot, pending: &LocalHerdrLifecycle) -> bool {
     herdr_record_is_still_running(
         snapshot,
         &pending.endpoint,
@@ -9544,7 +9659,7 @@ fn herdr_record_is_still_running(
 }
 
 #[cfg(test)]
-fn herdr_lifecycle_is_reflected(snapshot: &HostSnapshot, pending: &PendingHerdrLifecycle) -> bool {
+fn herdr_lifecycle_is_reflected(snapshot: &HostSnapshot, pending: &LocalHerdrLifecycle) -> bool {
     let HerdrInventory::Available { sessions, .. } = snapshot.herdr() else {
         return false;
     };
@@ -9971,6 +10086,23 @@ fn project_herdr_lifecycle(
     current_runtime: Option<&(host::LocalEndpoint, host::LinuxRuntimeIdentity)>,
     lifecycle: &Mutex<HerdrLifecycleState>,
 ) {
+    {
+        let lifecycle = lifecycle
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        for operation in &lifecycle.remote {
+            if let Some(host) = hosts
+                .iter_mut()
+                .find(|host| host.id == operation.request.host_id)
+                && let Some(session) = host
+                    .herdr_sessions
+                    .iter_mut()
+                    .find(|session| session.name == operation.request.session.name())
+            {
+                session.lifecycle_action = Some(operation.action);
+            }
+        }
+    }
     let Some((endpoint, runtime)) = current_runtime else {
         return;
     };
