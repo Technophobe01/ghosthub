@@ -175,6 +175,35 @@ public struct TmuxSessionKillRequest: Equatable, Sendable {
     }
 }
 
+/// The session a rename sheet opened for. The rename runs only while the
+/// session still has this identity, so a session that takes the name while
+/// the sheet is open is never renamed.
+public struct TmuxSessionRenameRequest: Equatable, Identifiable, Sendable {
+    public let session: WorkspaceTmuxSessionSelection
+    public let confirmedHost: HostSummary
+    public let serverPID: String
+    public let sessionID: String
+    public let sessionCreatedAt: String
+
+    public var id: String {
+        session.id
+    }
+
+    public init(
+        session: WorkspaceTmuxSessionSelection,
+        confirmedHost: HostSummary,
+        serverPID: String,
+        sessionID: String,
+        sessionCreatedAt: String
+    ) {
+        self.session = session
+        self.confirmedHost = confirmedHost
+        self.serverPID = serverPID
+        self.sessionID = sessionID
+        self.sessionCreatedAt = sessionCreatedAt
+    }
+}
+
 public struct WorktreeRemovalRequest: Equatable, Sendable {
     public let worktree: WorktreeSummary
     public let project: ProjectSummary
@@ -437,6 +466,8 @@ public struct InteractionHandlers {
             -> TmuxSessionKillRequest)?
     public let killTmuxSession:
         ((TmuxSessionKillRequest) async throws -> Void)?
+    public let renameTmuxSession:
+        ((TmuxSessionRenameRequest, String) async throws -> Void)?
     public let applyTmuxSessionTheme:
         ((WorkspaceTmuxSessionSelection) async throws -> Void)?
     public let createTmuxSession:
@@ -532,6 +563,8 @@ public struct InteractionHandlers {
             -> TmuxSessionKillRequest)? = nil,
         killTmuxSession:
         ((TmuxSessionKillRequest) async throws -> Void)? = nil,
+        renameTmuxSession:
+        ((TmuxSessionRenameRequest, String) async throws -> Void)? = nil,
         applyTmuxSessionTheme:
         ((WorkspaceTmuxSessionSelection) async throws -> Void)? = nil,
         createTmuxSession:
@@ -608,6 +641,7 @@ public struct InteractionHandlers {
         self.cancelHerdrSessionLifecycle = cancelHerdrSessionLifecycle
         self.prepareTmuxSessionKill = prepareTmuxSessionKill
         self.killTmuxSession = killTmuxSession
+        self.renameTmuxSession = renameTmuxSession
         self.applyTmuxSessionTheme = applyTmuxSessionTheme
         self.createTmuxSession = createTmuxSession
         self.currentWorkspaceSnapshot = currentWorkspaceSnapshot

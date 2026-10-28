@@ -632,10 +632,58 @@ final class NativeTmuxSessionCoordinator {
     }
 
     func detach(_ handle: BorrowedTmuxSessionHandle) {
+        guard let handle = currentHandle(handle) else { return }
         let key = sessionKey(handle)
-        guard handlesByKey[key] == handle else { return }
         handlesByKey.removeValue(forKey: key)
         removeHandle(handle, for: key, keyAlreadyRemoved: true)
+    }
+
+    /// Moves a launched attachment to its session's new name. The tmux
+    /// client stays attached across `rename-session`, so the surface keeps
+    /// running. Returns nil while the attachment is still provisioning or
+    /// resizing; the caller replaces the attachment instead.
+    func rename(
+        _ handle: BorrowedTmuxSessionHandle,
+        to name: String
+    ) -> BorrowedTmuxSessionHandle? {
+        let oldKey = sessionKey(handle)
+        var renamed = handle
+        renamed.name = name
+        let newKey = sessionKey(renamed)
+        guard !isShuttingDown,
+              handlesByKey[oldKey] == handle,
+              handlesByKey[newKey] == nil,
+              isSettled(handle)
+        else { return nil }
+        handlesByKey.removeValue(forKey: oldKey)
+        handlesByKey[newKey] = renamed
+        // Splits and Find target the exact client, not the session name, so
+        // they keep running. A client lookup reports its handle when it
+        // finishes, so it restarts with the renamed one, and the surface
+        // callbacks that captured the old name are reinstalled.
+        paneSplitClientBindings.removeValue(forKey: handle.id)?.task.cancel()
+        if hasLaunched(renamed),
+           terminalCoordinator.paneSurfaceIfPresent(
+               for: surfaceKey(renamed)
+           ) != nil {
+            _ = surface(handle: renamed)
+        }
+        return renamed
+    }
+
+    /// A handle that is attaching or resizing has work in flight that
+    /// targets its current name.
+    func isSettled(_ handle: BorrowedTmuxSessionHandle) -> Bool {
+        !provisioningHandles.contains(handle.id)
+            && pendingSizingByHandle[handle.id] == nil
+            && sizingTransitionTasks[handle.id]?.isEmpty ?? true
+    }
+
+    /// Callbacks can outlive a rename, so they resolve the handle by id.
+    private func currentHandle(
+        _ handle: BorrowedTmuxSessionHandle
+    ) -> BorrowedTmuxSessionHandle? {
+        handlesByKey.values.first { $0.id == handle.id }
     }
 
     @discardableResult
@@ -1901,7 +1949,7 @@ final class NativeTmuxSessionCoordinator {
     func requestAttachedSessionIdentity(
         _ handle: BorrowedTmuxSessionHandle
     ) {
-        guard handlesByKey[sessionKey(handle)] == handle else { return }
+        guard let handle = currentHandle(handle) else { return }
         previewIdentityRetryHandles.insert(handle.id)
         guard let attachment = attachments[handle.id],
               launchedAttachmentIDs[handle.id] == attachment.id
@@ -1942,6 +1990,66 @@ final class NativeTmuxSessionCoordinator {
         return client.sessionIdentity
     }
 
+    /// Detaches the duplicate's tmux client only while the kept client is
+    /// still attached to the same session. Returns false, and leaves both
+    /// attached, when tmux has not identified either client or refuses. It
+    /// also returns false when the duplicate was relaunched meanwhile, so
+    /// the caller never closes the new attachment.
+    func detachDuplicateClient(
+        _ duplicate: BorrowedTmuxSessionHandle,
+        keeping kept: BorrowedTmuxSessionHandle
+    ) async -> Bool {
+        guard let keptAttachment = attachments[kept.id],
+              let duplicateAttachment = attachments[duplicate.id],
+              launchedAttachmentIDs[kept.id] == keptAttachment.id,
+              launchedAttachmentIDs[duplicate.id] == duplicateAttachment.id,
+              paneSplitClients[kept.id] != nil,
+              let duplicateClient = paneSplitClients[duplicate.id]
+        else { return false }
+        let detached = await paneSplitter.detachClient(
+            duplicateClient,
+            keeping: paneSplitTarget(
+                handle: kept,
+                attachment: keptAttachment,
+                expectedIdentity: nil
+            )
+        )
+        return detached && wasDetached(duplicate, attachmentID: duplicateAttachment.id)
+    }
+
+    /// Detaches a client tmux may have moved off the session it last
+    /// reported, only while the session it is on now keeps another client.
+    /// Returns false, and leaves it attached, when tmux has not identified
+    /// the client, refuses, or the handle was relaunched meanwhile.
+    func detachClientSharingSession(
+        _ handle: BorrowedTmuxSessionHandle
+    ) async -> Bool {
+        guard let attachment = attachments[handle.id],
+              launchedAttachmentIDs[handle.id] == attachment.id,
+              paneSplitClients[handle.id] != nil
+        else { return false }
+        let detached = await paneSplitter.detachClientSharingSession(
+            target: paneSplitTarget(
+                handle: handle,
+                attachment: attachment,
+                expectedIdentity: nil
+            )
+        )
+        return detached && wasDetached(handle, attachmentID: attachment.id)
+    }
+
+    /// The detached client's exit can remove its attachment before tmux
+    /// replies; that alone is not a relaunch.
+    private func wasDetached(
+        _ handle: BorrowedTmuxSessionHandle,
+        attachmentID: UUID
+    ) -> Bool {
+        if let attachment = attachments[handle.id] {
+            return attachment.id == attachmentID
+        }
+        return !provisioningHandles.contains(handle.id)
+    }
+
     func requestPaneSplit(
         _ shortcut: TerminalPaneSplitShortcut,
         handle: BorrowedTmuxSessionHandle,
@@ -1962,9 +2070,9 @@ final class NativeTmuxSessionCoordinator {
         requiredLaunchFailureID: UUID? = nil
     ) {
         Task { [weak self] in
-            guard let self, !isShuttingDown else { return }
-            let key = sessionKey(handle)
-            guard handlesByKey[key] == handle else { return }
+            guard let self, !isShuttingDown,
+                  let handle = currentHandle(handle)
+            else { return }
             if let requiredAttachmentID {
                 guard attachments[handle.id]?.id == requiredAttachmentID,
                       launchedAttachmentIDs[handle.id]
@@ -1987,8 +2095,8 @@ final class NativeTmuxSessionCoordinator {
         processAlive: Bool,
         childExitCode: UInt32?
     ) {
+        guard let handle = currentHandle(handle) else { return }
         let key = sessionKey(handle)
-        guard handlesByKey[key] == handle else { return }
         let attachment = attachments.removeValue(forKey: handle.id)
         let launchedAttachmentID = launchedAttachmentIDs.removeValue(
             forKey: handle.id
